@@ -5,7 +5,7 @@ namespace Netcorext.Extensions.Threading;
 
 public class KeyLocker
 {
-    private static readonly ConcurrentDictionary<string, bool> CacheLockers = new();
+    private static readonly ConcurrentDictionary<string, bool> Lockers = new();
 
     public async Task WaitAsync(string key, CancellationToken cancellationToken = default)
     {
@@ -24,7 +24,7 @@ public class KeyLocker
         if (timeout.HasValue)
             stopwatch = Stopwatch.StartNew();
 
-        while (!CacheLockers.TryAdd(key, true) && CacheLockers.TryGetValue(key, out var locker) && locker)
+        while (!Lockers.TryAdd(key, true) && Lockers.TryGetValue(key, out var locker) && locker)
         {
             if (timeout.HasValue && stopwatch.Elapsed > timeout)
             {
@@ -44,11 +44,11 @@ public class KeyLocker
 
     public bool Release(string key)
     {
-        return CacheLockers.TryRemove(key, out _) || !CacheLockers.ContainsKey(key);
+        return Lockers.TryRemove(key, out _) || !Lockers.ContainsKey(key);
     }
     
     public bool ReleaseAll(string key)
     {
-        return CacheLockers.TryUpdate(key, false, true);
+        return Lockers.TryUpdate(key, false, true);
     }
 }
