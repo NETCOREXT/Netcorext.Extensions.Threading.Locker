@@ -6,7 +6,7 @@ public class KeyCountLocker
 {
     private readonly long _minimum;
     private readonly long? _maximum;
-    private static readonly ConcurrentDictionary<string, long> CountLockers = new();
+    private static readonly ConcurrentDictionary<string, KeyLockerState<long>> CountLockers = new();
     private static readonly KeyLocker Locker = new();
 
     public KeyCountLocker(long minimum = 1, long? maximum = null)
@@ -14,45 +14,51 @@ public class KeyCountLocker
         _minimum = minimum;
         _maximum = maximum;
     }
-    
+
     public async Task<bool> IncrementAsync(string key, CancellationToken cancellationToken = default)
     {
+        var newLocker = new KeyLockerState<long>
+                        {
+                            State = _minimum
+                        };
         try
         {
             await Locker.WaitAsync(key, cancellationToken);
-        
-            if (CountLockers.TryAdd(key, _minimum)) return true;
-        
-            if (!CountLockers.TryGetValue(key, out var count))
-                if (CountLockers.TryAdd(key, _minimum)) return true;
 
-            if (_maximum.HasValue && count + 1 > _maximum) return false;
+            if (!CountLockers.TryGetValue(key, out var oldLocker))
+                return CountLockers.TryAdd(key, newLocker);
+
+            if (oldLocker.State + 1 > _maximum)
+                return false;
             
-            if (CountLockers.TryUpdate(key, count + 1, count)) return true;
-
-            return false;
+            newLocker.State = oldLocker.State + 1;
+            
+            return CountLockers.TryUpdate(key, newLocker, oldLocker);
         }
         finally
         {
             Locker.Release(key);
         }
     }
-    
+
     public async Task<bool> DecrementAsync(string key, CancellationToken cancellationToken = default)
     {
         try
         {
             await Locker.WaitAsync(key, cancellationToken);
-        
-            if (!CountLockers.TryGetValue(key, out var count)) return true;
 
-            if (count - 1 > _minimum && CountLockers.TryUpdate(key, count - 1, count))
+            if (!CountLockers.TryGetValue(key, out var oldLocker))
                 return true;
             
-            if (count - 1 <= _minimum && CountLockers.TryRemove(key, out _))
+            var newLocker = new KeyLockerState<long>
+                            {
+                                State = oldLocker.State - 1
+                            };
+
+            if (newLocker.State > _minimum && CountLockers.TryUpdate(key, newLocker, oldLocker))
                 return true;
 
-            return false;
+            return newLocker.State <= _minimum && CountLockers.TryRemove(key, out _);
         }
         finally
         {
@@ -62,9 +68,9 @@ public class KeyCountLocker
 
     public Task<long> GetAsync(string key, CancellationToken cancellationToken = default)
     {
-        if (!CountLockers.TryGetValue(key, out var count))
+        if (!CountLockers.TryGetValue(key, out var locker))
             return Task.FromResult(_minimum);
 
-        return Task.FromResult(count);
+        return Task.FromResult(locker.State);
     }
 }
