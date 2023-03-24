@@ -57,4 +57,15 @@ public class KeyLocker
 
         return Lockers.TryUpdate(key, newLocker, oldLocker);
     }
+
+    public void Prune(params string[] keys)
+    {
+        var keysToRemove = keys.Length == 0 ? Lockers.Keys : keys;
+
+        foreach (var key in keysToRemove)
+        {
+            if (Lockers.TryGetValue(key, out var locker) && locker.IsExpired)
+                Lockers.TryRemove(key, out _);    
+        }
+    }
 }
