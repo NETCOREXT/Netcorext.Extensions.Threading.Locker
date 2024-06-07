@@ -8,13 +8,7 @@ public class KeyCountLocker : KeyLocker
     private readonly long _minimum;
     private readonly long? _maximum;
     private static readonly ConcurrentDictionary<string, KeyLockerState<long>> CountLockers = new();
-
-    public KeyCountLocker(long minimum = 1, long? maximum = null)
-    {
-        _minimum = minimum;
-        _maximum = maximum;
-    }
-
+    
     public KeyCountLocker(long minimum = 1, long? maximum = null, long deadLockTimes = DEFAULT_DEAD_LOCK_TIMES, ILogger? logger = null) : base(deadLockTimes, logger)
     {
         _minimum = minimum;
