@@ -1,31 +1,42 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
+using Netcorext.Extensions.Threading;
 
-namespace Netcorext.Extensions.Threading;
-
+/// <summary>
+/// Provides a key-based locking mechanism for controlling concurrent access to resources.
+/// </summary>
 public class KeyLocker : IDisposable
 {
-    private bool _disposed;
+    private volatile int _disposed;
     private readonly int _maxConcurrent;
     private readonly TimeSpan? _timeout;
+    private readonly TimeSpan _cleanupInterval;
     private readonly bool _throwTimeoutException;
-    private readonly TimeSpan? _expired;
     private readonly ILogger _logger;
     private readonly ConcurrentDictionary<string, KeyState> _locks = new();
-    private readonly ConcurrentDictionary<string, Timer> _timers = new();
+    private readonly Timer _cleanupTimer;
 
-    public KeyLocker(ILogger logger, TimeSpan? timeout = null, bool throwTimeoutException = false, TimeSpan? expired = null, int maxConcurrent = 1)
+    /// <summary>
+    /// Initializes a new instance of the KeyLocker class.
+    /// </summary>
+    /// <param name="logger">The logger instance for recording events.</param>
+    /// <param name="timeout">Optional timeout for wait operations.</param>
+    /// <param name="throwTimeoutException">Whether to throw an exception on timeout.</param>
+    /// <param name="maxConcurrent">Maximum number of concurrent operations allowed.</param>
+    /// <param name="cleanupInterval">Interval for cleaning up expired locks. Default is 5 minutes.</param>
+    public KeyLocker(ILogger logger, TimeSpan? timeout = null, bool throwTimeoutException = false, int maxConcurrent = 1, TimeSpan? cleanupInterval = null)
     {
-        _maxConcurrent = maxConcurrent;
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _timeout = timeout;
         _throwTimeoutException = throwTimeoutException;
-        _expired = expired ?? TimeSpan.FromMilliseconds(10 * 60 * 1000);
-        _logger = logger;
+        _maxConcurrent = maxConcurrent > 0 ? maxConcurrent : throw new ArgumentException("maxConcurrent must be greater than 0", nameof(maxConcurrent));
+        _cleanupInterval = cleanupInterval ?? TimeSpan.FromMinutes(5);
+        _cleanupTimer = new Timer(CleanupIdleLocks, null, _cleanupInterval, _cleanupInterval);
     }
 
     public void Wait(string key)
     {
-        var keyState = _locks.AddOrUpdate(key, CreateLockItem, (k, state) =>
+        var keyState = _locks.AddOrUpdate(key, CreateLockItem, (_, state) =>
                                                                {
                                                                    lock (state)
                                                                    {
@@ -42,9 +53,6 @@ public class KeyLocker : IDisposable
         {
             if (keyState.ReleaseAll)
                 return;
-
-            if (_expired.HasValue && _timers.TryAdd(key, new Timer(HandleExpired, key, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan)))
-                _timers[key].Change(_expired.Value, _expired.Value);
 
             if (_timeout.HasValue)
             {
@@ -63,7 +71,7 @@ public class KeyLocker : IDisposable
 
     public async Task WaitAsync(string key)
     {
-        var keyState = _locks.AddOrUpdate(key, CreateLockItem, (k, state) =>
+        var keyState = _locks.AddOrUpdate(key, CreateLockItem, (_, state) =>
                                                                {
                                                                    lock (state)
                                                                    {
@@ -80,9 +88,6 @@ public class KeyLocker : IDisposable
         {
             if (keyState.ReleaseAll)
                 return;
-
-            if (_expired.HasValue && _timers.TryAdd(key, new Timer(HandleExpired, key, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan)))
-                _timers[key].Change(_expired.Value, _expired.Value);
 
             if (_timeout.HasValue)
             {
@@ -135,8 +140,6 @@ public class KeyLocker : IDisposable
             if (keyState.ReleaseAll || keyState.Cancellation.IsCancellationRequested)
                 return 0;
 
-            keyState.ReleaseAll = true;
-
             var releaseCount = 0;
 
             try
@@ -145,6 +148,7 @@ public class KeyLocker : IDisposable
                 {
                     try
                     {
+                        keyState.ReleaseAll = true;
                         keyState.LastWaitingTime = DateTimeOffset.UtcNow;
                         keyState.Semaphore.Release();
                         keyState.DecrementConcurrent();
@@ -167,23 +171,31 @@ public class KeyLocker : IDisposable
 
     public void Reset(string key)
     {
-        if (!_locks.TryGetValue(key, out var keyState))
+        if (!_locks.TryRemove(key, out var keyState))
             return;
 
         lock (keyState)
         {
-            keyState.LastWaitingTime = DateTimeOffset.UtcNow;
-            keyState.Cancellation = new CancellationTokenSource();
-            keyState.ReleaseAll = false;
-        }
+            try
+            {
+                while (true)
+                {
+                    try
+                    {
+                        keyState.Semaphore.Release();
+                    }
+                    catch (SemaphoreFullException)
+                    {
+                        keyState.Cancellation.Cancel(true);
 
-        if (!_timers.TryRemove(key, out var timer))
-            return;
+                        break;
+                    }
+                }
+            }
+            catch (ObjectDisposedException) { }
+            catch (ArgumentOutOfRangeException) { }
 
-        lock (timer)
-        {
-            timer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
-            timer.Dispose();
+            keyState.Dispose();
         }
     }
 
@@ -192,43 +204,38 @@ public class KeyLocker : IDisposable
         return _locks.TryGetValue(key, out var keyState) ? keyState.WaitingConcurrent : 0;
     }
 
+    public bool HasLock(string key)
+    {
+        return _locks.ContainsKey(key);
+    }
+
     private void HandleTimeout(KeyState keyState)
     {
-        _logger.LogWarning("Lock on key '{Key}' timed out", keyState.Key);
+        _logger.LogWarning("Lock on key '{Key}' timed out after {Timeout}", keyState.Key, _timeout);
 
         Release(keyState.Key);
 
         if (_throwTimeoutException)
-            throw new TimeoutException($"Lock on key '{keyState.Key}' timed out.");
+            throw new TimeoutException($"Lock operation timed out for key: {keyState.Key}");
     }
 
-    private void HandleExpired(object? state)
+    private void CleanupIdleLocks(object? state)
     {
-        if (state is not string key || !_locks.TryGetValue(key, out var keyState))
-            return;
+        var now = DateTimeOffset.UtcNow;
 
-        var elapsed = DateTimeOffset.UtcNow.Subtract(keyState.LastWaitingTime);
+        var idledKeys = _locks
+                       .Where(kvp => now - kvp.Value.LastWaitingTime > _cleanupInterval && !kvp.Value.ReleaseAll)
+                       .Select(kvp => kvp.Key)
+                       .ToArray();
 
-        if (!_expired.HasValue || !(elapsed >= _expired))
-            return;
-
-        lock (keyState)
+        foreach (var key in idledKeys)
         {
-            if (!_locks.TryRemove(keyState.Key, out _))
-                return;
+            _logger.LogInformation("Cleaning up idled lock for key '{Key}'", key);
 
-            _logger.LogWarning("Key '{Key}' expired({Elapsed}), has been removed", keyState.Key, elapsed);
+            if (!_locks.TryRemove(key, out var keyState)) continue;
 
-            if (_timers.TryRemove(keyState.Key, out var timer))
-            {
-                lock (timer)
-                {
-                    timer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
-                    timer.Dispose();
-                }
-            }
-
-            keyState.Dispose();
+            keyState.Cancellation.Cancel();
+            keyState.Semaphore.Dispose();
         }
     }
 
@@ -248,21 +255,26 @@ public class KeyLocker : IDisposable
 
     public void Dispose()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
 
-        _disposed = true;
+        _cleanupTimer.Change(TimeSpan.Zero, TimeSpan.Zero);
+        _cleanupTimer.Dispose();
 
-        foreach (var key in _locks.Keys)
+        foreach (var keyState in _locks.Values)
         {
-            if (_locks.TryRemove(key, out var keyState))
-                keyState.Dispose();
+            try
+            {
+                keyState.Cancellation.Cancel();
+                keyState.Semaphore.Dispose();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error during KeyLocker disposal");
+            }
         }
 
-        foreach (var key in _timers.Keys)
-        {
-            if (_timers.TryRemove(key, out var timer))
-                timer.Dispose();
-        }
+        _locks.Clear();
+        GC.SuppressFinalize(this);
     }
 }
