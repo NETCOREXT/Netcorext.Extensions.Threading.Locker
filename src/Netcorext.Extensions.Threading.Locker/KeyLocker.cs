@@ -234,7 +234,6 @@ public class KeyLocker : IDisposable
 
             if (!_locks.TryRemove(key, out var keyState)) continue;
 
-            keyState.Cancellation.Cancel();
             keyState.Semaphore.Dispose();
         }
     }
@@ -265,7 +264,6 @@ public class KeyLocker : IDisposable
         {
             try
             {
-                keyState.Cancellation.Cancel();
                 keyState.Semaphore.Dispose();
             }
             catch (Exception ex)
